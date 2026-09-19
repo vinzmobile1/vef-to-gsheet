@@ -1,0 +1,6 @@
+{
+  "name": "VEF ERPNext to Google Sheets Exporter",
+  "description": "Export data Item Summary dari ERPNext Frappe VEF ke Google Sheets dengan autentikasi akun per-user, isolasi card mandiri, penjadwalan otomatis penarikan berdasarkan jam, dan notifikasi real-time.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

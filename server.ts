@@ -4,6 +4,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import {
   connectMongoDB,
+  getMongoDb,
   startMongoKeepAlive,
   getMongoStatus,
   fetchAllProfilesFromDB,
@@ -21,6 +22,36 @@ const PORT = 3000;
 
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// Serverless / Vercel compatibility middleware
+app.use(async (req, res, next) => {
+  // Normalize path if Vercel serverless rewrite stripped the /api prefix
+  if (
+    !req.url.startsWith("/api") &&
+    !req.url.startsWith("/assets") &&
+    req.url !== "/" &&
+    !req.url.startsWith("/@") &&
+    !req.url.startsWith("/favicon")
+  ) {
+    req.url = `/api${req.url}`;
+  }
+
+  // Lazy connect to MongoDB Atlas on cold start in serverless environments
+  if (process.env.MONGODB_URI && !getMongoDb()) {
+    try {
+      const ok = await connectMongoDB();
+      if (ok && (!sheetProfiles || sheetProfiles.length === 0)) {
+        const dbProfiles = await fetchAllProfilesFromDB();
+        if (dbProfiles && dbProfiles.length > 0) {
+          sheetProfiles = dbProfiles;
+        }
+      }
+    } catch (e) {
+      // Non-blocking fallback to in-memory profiles
+    }
+  }
+  next();
+});
 
 export interface SheetProfile {
   id: string;
@@ -593,44 +624,103 @@ async function runProfileSync(profile: SheetProfile, isManual: boolean = false) 
   }
 }
 
-// Background ticker: every 15 seconds, check Jakarta time against scheduleTimes for each active card
-setInterval(async () => {
+// Core Scheduler Execution Logic (Used by both background ticker and Vercel Cron/Webhook)
+export async function executeScheduledSyncs(forceAll: boolean = false) {
   const { timeStr, dateKey } = getJakartaTime();
+  const executedCards: string[] = [];
+
+  // If in serverless environment and profiles not yet loaded from MongoDB, sync them
+  if (process.env.MONGODB_URI && (!sheetProfiles || sheetProfiles.length === 0)) {
+    try {
+      await connectMongoDB();
+      const dbProfiles = await fetchAllProfilesFromDB();
+      if (dbProfiles && dbProfiles.length > 0) {
+        sheetProfiles = dbProfiles;
+      }
+    } catch (e) {
+      console.warn("[Cron DB Load Warning]:", e);
+    }
+  }
 
   for (const profile of sheetProfiles) {
-    // Ensure scheduleTimes is valid array
     profile.scheduleTimes = normalizeScheduleTimes(profile.scheduleTimes);
-
-    // Keep next run info always fresh
     const nextRun = calculateNextRunTime(profile.scheduleTimes, profile.timezone);
     profile.nextRunTimestamp = nextRun.nextRunTimestamp;
     profile.nextRunTimeStr = nextRun.nextRunTimeStr;
 
     if (!profile.scheduleEnabled) continue;
 
-    // Check if current time in Jakarta matches one of the configured schedule times (e.g. 09:00, 14:00, 17:00)
-    if (profile.scheduleTimes.includes(timeStr)) {
+    // Check if current Jakarta time matches schedule (e.g. 09:00, 14:00, 17:00) OR forced run
+    const isMatchingTime = profile.scheduleTimes.includes(timeStr);
+    if (isMatchingTime || forceAll) {
       const slotKey = `${dateKey}_${timeStr}`;
-      if (profile.lastExecutedSlot === slotKey) {
-        // Already executed in this minute slot
+      if (!forceAll && profile.lastExecutedSlot === slotKey) {
         continue;
       }
 
       profile.lastExecutedSlot = slotKey;
       console.log(
-        `[Scheduler] ⏰ Waktu terjadwal cocok [${timeStr} WIB GMT+7] untuk card "${profile.name}". Menjalankan sinkronisasi otomatis...`
+        `[Scheduler] ⏰ Menjalankan sinkronisasi [${timeStr} WIB GMT+7] untuk card "${profile.name}"...`
       );
 
       try {
         await runProfileSync(profile, false);
+        executedCards.push(profile.name);
       } catch (err) {
         console.error(`[Scheduler Error] pada card "${profile.name}":`, err);
       }
     }
   }
-}, 15 * 1000);
+
+  return { timeStr, dateKey, executedCards };
+}
+
+// Background ticker for persistent servers (Container, Cloud Run, VPS):
+// Every 15 seconds, check Jakarta time against scheduleTimes for each active card
+if (!process.env.VERCEL) {
+  setInterval(async () => {
+    try {
+      await executeScheduledSyncs(false);
+    } catch (err) {
+      console.error("[Scheduler Ticker Error]:", err);
+    }
+  }, 15 * 1000);
+}
 
 // --- API ROUTES ---
+
+// Health Check Endpoint
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    environment: process.env.VERCEL ? "vercel" : "standalone",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Cron Webhook Endpoint (Compatible with Vercel Cron, cron-job.org, EasyCron, etc.)
+app.all("/api/cron", async (req, res) => {
+  try {
+    const force = req.query.force === "true" || req.query.all === "true";
+    const result = await executeScheduledSyncs(force);
+
+    return res.json({
+      success: true,
+      message: force
+        ? `Sinkronisasi paksa berhasil dipicu untuk seluruh card aktif.`
+        : `Pengecekan jadwal selesai untuk waktu ${result.timeStr} WIB. Menjalankan ${result.executedCards.length} card.`,
+      executedCards: result.executedCards,
+      totalExecuted: result.executedCards.length,
+      currentJakartaTime: `${result.timeStr} WIB`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      message: err.message || "Gagal menjalankan sinkronisasi cron.",
+    });
+  }
+});
 
 // 1. VEF Login Endpoint
 app.post("/api/vef/login", async (req, res) => {
@@ -1363,4 +1453,11 @@ async function startServer() {
   });
 }
 
-startServer();
+// Export Express app for Vercel Serverless Functions
+export { app };
+export default app;
+
+// Only start standalone HTTP listener in non-Vercel environments (Local dev, Docker, Cloud Run)
+if (!process.env.VERCEL) {
+  startServer();
+}

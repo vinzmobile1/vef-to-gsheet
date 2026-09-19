@@ -1,7 +1,6 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
 import {
   connectMongoDB,
   getMongoDb,
@@ -25,15 +24,30 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 // Serverless / Vercel compatibility middleware
 app.use(async (req, res, next) => {
-  // Normalize path if Vercel serverless rewrite stripped the /api prefix
-  if (
+  // If Vercel passed the path in [all] query param
+  if (req.query && req.query.all) {
+    const allParam = Array.isArray(req.query.all) ? req.query.all.join("/") : String(req.query.all);
+    if (!req.url.startsWith("/api/")) {
+      req.url = `/api/${allParam}`;
+    }
+  }
+
+  // Restore original URL from Vercel headers if present
+  const forwardedUrl =
+    (req.headers["x-forwarded-url"] as string) ||
+    (req.headers["x-matched-path"] as string) ||
+    (req.headers["x-vercel-matched-path"] as string);
+
+  if (forwardedUrl && typeof forwardedUrl === "string" && forwardedUrl.startsWith("/api/")) {
+    req.url = forwardedUrl;
+  } else if (
     !req.url.startsWith("/api") &&
     !req.url.startsWith("/assets") &&
     req.url !== "/" &&
     !req.url.startsWith("/@") &&
     !req.url.startsWith("/favicon")
   ) {
-    req.url = `/api${req.url}`;
+    req.url = `/api${req.url.startsWith("/") ? "" : "/"}${req.url}`;
   }
 
   // Lazy connect to MongoDB Atlas on cold start in serverless environments
@@ -1405,6 +1419,7 @@ app.all("/api/*", (req, res) => {
 // Start Server with Vite Middleware
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
